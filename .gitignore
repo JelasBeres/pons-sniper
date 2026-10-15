@@ -1,0 +1,9 @@
+node_modules/
+
+# sniper wallet key, open positions and trade history: never commit these
+sniper-config.json
+sniper-positions.json
+sniper-history.json
+
+.env*
+.DS_Store
