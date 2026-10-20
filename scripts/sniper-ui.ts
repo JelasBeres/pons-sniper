@@ -282,6 +282,16 @@ const server = http.createServer(async (req, res) => {
         return sendJson(res, 400, { error: (e.shortMessage || e.message || "Sell failed").split("\n")[0] });
       }
     }
+    if (req.method === "POST" && req.url === "/api/history/delete") {
+      const body = await readBody(req);
+      const history = readJson<Trade[]>(HISTORY_PATH, []);
+      const kept = body.all === true
+        ? []
+        : history.filter((t) => !(t.token.toLowerCase() === String(body.token ?? "").toLowerCase() && t.closedAt === Number(body.closedAt)));
+      if (kept.length === history.length && body.all !== true) return sendJson(res, 404, { error: "Trade not found in history." });
+      fs.writeFileSync(HISTORY_PATH, JSON.stringify(kept, null, 2), "utf-8");
+      return sendJson(res, 200, { ok: true, removed: history.length - kept.length });
+    }
     if (req.method === "POST" && req.url === "/api/stop") {
       stopBot();
       return sendJson(res, 200, { ok: true });
@@ -310,7 +320,7 @@ const PAGE = String.raw`<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Pons Sniper</title>
+<title>Pons Sniper :${PORT}</title>
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
@@ -346,7 +356,7 @@ const PAGE = String.raw`<!doctype html>
 <body>
 <main>
   <div class="row">
-    <h1>Pons Sniper <span class="muted" style="font-size:13px;font-weight:400">Robinhood Chain</span></h1>
+    <h1>Pons Sniper <span class="muted" style="font-size:13px;font-weight:400">Robinhood Chain · port ${PORT}</span></h1>
     <span id="status" class="pill">Mati</span>
   </div>
 
@@ -374,6 +384,7 @@ const PAGE = String.raw`<!doctype html>
     <div class="row" style="margin-bottom:12px">
       <h2 style="margin:0">Riwayat trade</h2>
       <span id="totalPnl" class="muted"></span>
+      <button id="btnClearHistory" type="button">Hapus semua riwayat</button>
     </div>
     <div id="history" class="muted">Belum ada trade yang selesai.</div>
   </div>
@@ -485,10 +496,10 @@ const PAGE = String.raw`<!doctype html>
       var profit = known.reduce(function (sum, t) { return sum + (Number(t.receivedWei) - Number(t.costWei)) / 1e18; }, 0);
       $("totalPnl").innerHTML = known.length ? "Total: " + signed(profit) + " ETH (" + known.length + " trade, belum termasuk gas)" : "";
       $("history").innerHTML = s.history.length
-        ? '<div class="scroll"><table><tr><th>Token</th><th>Modal</th><th>Diterima</th><th>Untung/rugi</th><th>Alasan jual</th><th>Waktu</th></tr>' + s.history.map(function (t) {
+        ? '<div class="scroll"><table><tr><th>Token</th><th>Modal</th><th>Diterima</th><th>Untung/rugi</th><th>Alasan jual</th><th>Waktu</th><th></th></tr>' + s.history.map(function (t) {
             var got = t.receivedWei === null ? '<span class="muted">tidak diketahui</span>' : eth(t.receivedWei) + " ETH";
             var pnl = t.receivedWei === null ? "-" : pct(((Number(t.receivedWei) - Number(t.costWei)) / Number(t.costWei)) * 100);
-            return "<tr><td>$" + esc(t.symbol) + "</td><td>" + eth(t.costWei) + " ETH</td><td>" + got + "</td><td>" + pnl + "</td><td>" + esc(REASONS[t.reason] || t.reason) + "</td><td>" + new Date(t.closedAt).toLocaleString() + "</td></tr>";
+            return "<tr><td>$" + esc(t.symbol) + "</td><td>" + eth(t.costWei) + " ETH</td><td>" + got + "</td><td>" + pnl + "</td><td>" + esc(REASONS[t.reason] || t.reason) + "</td><td>" + new Date(t.closedAt).toLocaleString() + '</td><td><button type="button" data-del="' + esc(t.token) + '" data-closed="' + t.closedAt + '" data-symbol="' + esc(t.symbol) + '">Hapus</button></td></tr>';
           }).join("") + "</table></div>"
         : "Belum ada trade yang selesai.";
     }).catch(function () { setMsg("Dashboard tidak bisa dihubungi. Apakah scripts/sniper-ui.ts masih jalan?", true); });
@@ -516,6 +527,18 @@ const PAGE = String.raw`<!doctype html>
     post("/api/sell", { token: token }).then(function (r) { setMsg("Terjual, diterima sekitar " + Number(r.received).toFixed(6) + " ETH."); refresh(); })
       .catch(function (err) { setMsg(err.message, true); });
   });
+
+  $("history").addEventListener("click", function (e) {
+    var token = e.target && e.target.getAttribute && e.target.getAttribute("data-del");
+    if (!token) return;
+    if (!confirm("Hapus $" + e.target.getAttribute("data-symbol") + " dari riwayat? Token di wallet tidak ikut terjual atau hilang.")) return;
+    post("/api/history/delete", { token: token, closedAt: Number(e.target.getAttribute("data-closed")) })
+      .then(function () { setMsg("Riwayat dihapus."); refresh(); }).catch(function (err) { setMsg(err.message, true); });
+  });
+  $("btnClearHistory").onclick = function () {
+    if (!confirm("Hapus SEMUA riwayat trade? Ini tidak bisa dibatalkan.")) return;
+    post("/api/history/delete", { all: true }).then(function () { setMsg("Semua riwayat dihapus."); refresh(); }).catch(function (err) { setMsg(err.message, true); });
+  };
 
   refresh();
   setInterval(refresh, 1500);

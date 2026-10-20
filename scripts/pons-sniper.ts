@@ -106,7 +106,8 @@ function loadConfig(): SniperConfig {
 const cfg = loadConfig();
 const account = privateKeyToAccount((cfg.privateKey.startsWith("0x") ? cfg.privateKey : `0x${cfg.privateKey}`) as Hex);
 const transport = http(cfg.rpcUrl || process.env.ROBINHOOD_RPC_URL || undefined);
-const publicClient = createPublicClient({ chain: robinhoodChain, transport });
+// viem polls receipts every 4s by default; Robinhood Chain makes ~10 blocks a second
+const publicClient = createPublicClient({ chain: robinhoodChain, transport, pollingInterval: 250 });
 const walletClient = createWalletClient({ account, chain: robinhoodChain, transport });
 
 const BUY_WEI = parseEther(cfg.buyEth);
@@ -122,6 +123,8 @@ let positions: Position[] = [];
 let spentWei = 0n;
 // Launches that pass every filter except the anti-snipe tax, re-checked each loop until it decays or they get too old
 let waiting: LaunchLog[] = [];
+// Launches a buy transaction was sent for: never retried after an error, since the buy may have gone through
+const buySent = new Set<string>();
 // Launches whose buy simulation reverted once; logged a single time, then retried quietly like `waiting`
 const revertLogged = new Set<string>();
 
@@ -131,7 +134,9 @@ const shortError = (err: unknown) => {
   // A revert's first line is only "reverted with the following signature:", the useful part is the reason/selector
   const revert = err instanceof BaseError ? err.walk((e) => e instanceof ContractFunctionRevertedError) : null;
   if (revert instanceof ContractFunctionRevertedError) {
-    return `reverted: ${revert.reason || revert.data?.errorName || revert.signature || "no reason"}`;
+    // Pons curve errors missing from the ABI, by selector
+    const known: Record<string, string> = { "0x71c4efed": "SlippageExceeded (price moved before the buy was sent)" };
+    return `reverted: ${revert.reason || revert.data?.errorName || (revert.signature && known[revert.signature]) || revert.signature || "no reason"}`;
   }
   const e = err as { shortMessage?: string; message?: string };
   return (e.shortMessage || e.message || String(err)).split("\n")[0];
@@ -209,6 +214,22 @@ async function rejectReason(launch: LaunchLog): Promise<{ reason: string | null;
   return { reason, symbol };
 }
 
+/**
+ * A failed RPC call while checking a launch is usually a blip, so the launch stays queued and is checked again
+ * (rejectReason drops it once it is older than maxLaunchAgeSeconds). Only a launch whose buy was already sent is dropped.
+ */
+function retryAfterError(launch: LaunchLog, err: unknown) {
+  if (buySent.has(launch.token)) {
+    waiting = waiting.filter((w) => w.token !== launch.token);
+    return log(`skip  ${launch.token}: ${shortError(err)}`);
+  }
+  if (!waiting.some((w) => w.token === launch.token)) waiting.push(launch);
+  if (!revertLogged.has(launch.token)) {
+    revertLogged.add(launch.token);
+    log(`wait  ${launch.token}: ${shortError(err)}, retrying until maxLaunchAgeSeconds`);
+  }
+}
+
 async function snipe(launch: LaunchLog) {
   if (positions.some((p) => p.token === launch.token)) return;
   const { reason, symbol, retry } = await rejectReason(launch);
@@ -227,7 +248,12 @@ async function snipe(launch: LaunchLog) {
 
   const balance = await publicClient.getBalance({ address: account.address });
   const underfunded = balance < BUY_WEI + GAS_RESERVE_WEI;
-  if (underfunded && EXECUTE) return log(`skip  $${symbol}: wallet balance ${formatEther(balance)} ETH is too low`);
+  // A wallet a little short of buyEth + gas reserve still buys with what it has (balance minus the reserve)
+  // instead of missing the launch; only skip when that would be under half of buyEth
+  const spendable = balance > GAS_RESERVE_WEI ? balance - GAS_RESERVE_WEI : 0n;
+  const buyWei = underfunded && EXECUTE ? spendable : BUY_WEI;
+  if (buyWei * 2n < BUY_WEI) return log(`skip  $${symbol}: wallet balance ${formatEther(balance)} ETH is too low`);
+  if (buyWei < BUY_WEI) log(`note  $${symbol}: balance ${formatEther(balance)} ETH is short, buying with ${formatEther(buyWei)} ETH instead of ${cfg.buyEth}`);
 
   // Simulating the real buy both prices it and catches honeypot-style reverts before any ETH is sent
   const simulation = await publicClient.simulateContract({
@@ -235,10 +261,10 @@ async function snipe(launch: LaunchLog) {
     address: launch.curve,
     abi: PONS_CURVE_ABI,
     functionName: "buy",
-    args: [BUY_WEI, 0n, account.address],
-    value: BUY_WEI,
+    args: [buyWei, 0n, account.address],
+    value: buyWei,
     // A dry run should still price the buy when the wallet is not funded yet
-    stateOverride: underfunded ? [{ address: account.address, balance: BUY_WEI + parseEther("1") }] : undefined,
+    stateOverride: underfunded && !EXECUTE ? [{ address: account.address, balance: BUY_WEI + parseEther("1") }] : undefined,
   }).catch((err) => {
     // Right after a launch the RPC can answer from a node that is a block behind, so keep trying until it is too old
     if (!revertLogged.has(launch.token)) {
@@ -257,20 +283,31 @@ async function snipe(launch: LaunchLog) {
     return log(`DRY   would buy $${symbol} ${launch.token} with ${cfg.buyEth} ETH -> ${Number(formatEther(tokensOut)).toLocaleString()} tokens`);
   }
 
-  const buyTx = await walletClient.writeContract({ ...request, args: [BUY_WEI, minTokensOut, account.address] });
+  // writeContract estimates gas first, so a revert there (e.g. SlippageExceeded when the price moved since the
+  // simulation) means nothing was sent and the launch can be retried; any other failure may have broadcast the buy
+  const buyTx = await walletClient.writeContract({ ...request, args: [buyWei, minTokensOut, account.address] }).catch((err) => {
+    const reverted = err instanceof BaseError && err.walk((e) => e instanceof ContractFunctionRevertedError) instanceof ContractFunctionRevertedError;
+    if (!reverted) buySent.add(launch.token);
+    throw err;
+  });
+  buySent.add(launch.token);
   // Track it as soon as it is sent: if the receipt wait fails, the position is still managed (or closed once
   // the balance turns out to be zero) and the budget still counts it
-  spentWei += BUY_WEI;
-  positions.push({ token: launch.token, curve: launch.curve, symbol, costWei: BUY_WEI.toString(), boughtAt: Date.now(), buyTx });
+  spentWei += buyWei;
+  positions.push({ token: launch.token, curve: launch.curve, symbol, costWei: buyWei.toString(), boughtAt: Date.now(), buyTx });
   savePositions();
   const receipt = await publicClient.waitForTransactionReceipt({ hash: buyTx });
   if (receipt.status !== "success") {
-    spentWei -= BUY_WEI;
+    spentWei -= buyWei;
     positions = positions.filter((p) => p.token !== launch.token);
     savePositions();
-    return log(`FAIL  buy $${symbol} reverted (${buyTx})`);
+    // A mined revert bought nothing (only gas was spent), usually because the price ran past the slippage limit
+    // while the tx was pending, so re-price and try again until the launch is too old
+    buySent.delete(launch.token);
+    if (!waiting.some((w) => w.token === launch.token)) waiting.push(launch);
+    return log(`FAIL  buy $${symbol} reverted (${buyTx}), retrying with a fresh price until maxLaunchAgeSeconds`);
   }
-  log(`BUY   $${symbol} ${launch.token} for ${cfg.buyEth} ETH (${buyTx})`);
+  log(`BUY   $${symbol} ${launch.token} for ${formatEther(buyWei)} ETH (${buyTx})`);
 
   // Approve once now so the exit is a single transaction later (retried before selling if this fails)
   await ensureAllowance(launch.token, launch.curve, maxUint256).catch((err) => log(`warn  approve $${symbol}: ${shortError(err)}`));
@@ -373,17 +410,13 @@ async function main() {
         for (const l of logs) {
           const { token, curve, deployer, pairToken } = l.args;
           if (!token || !curve || !deployer || !pairToken) continue;
-          await snipe({ token, curve, deployer, pairToken, blockNumber: l.blockNumber }).catch((err) =>
-            log(`skip  ${token}: ${shortError(err)}`)
-          );
+          const launch = { token, curve, deployer, pairToken, blockNumber: l.blockNumber };
+          await snipe(launch).catch((err) => retryAfterError(launch, err));
         }
       }
 
       for (const launch of [...waiting]) {
-        await snipe(launch).catch((err) => {
-          waiting = waiting.filter((w) => w.token !== launch.token);
-          log(`skip  ${launch.token}: ${shortError(err)}`);
-        });
+        await snipe(launch).catch((err) => retryAfterError(launch, err));
       }
 
       if (EXECUTE && Date.now() - lastPositionCheck >= POSITION_CHECK_MS) {

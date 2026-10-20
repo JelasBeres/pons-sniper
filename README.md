@@ -3,7 +3,7 @@
 Bot snipe token Pons v2 di Robinhood Chain, lengkap dengan dashboard web lokal.
 
 - Menunggu launch dari wallet dev tertentu (atau semua dev), lalu membeli begitu snipe tax Pons turun di bawah batas.
-- Jual otomatis saat take profit, stop loss, atau waktu hold habis. Ada juga tombol **Jual sekarang**.
+- Jual otomatis saat take profit, stop loss, atau waktu hold habis (`maxHoldSeconds: 0` = tanpa batas waktu hold). Ada juga tombol **Jual sekarang**.
 - Menampilkan untung/rugi posisi terbuka dan riwayat trade.
 
 ## Cara pakai

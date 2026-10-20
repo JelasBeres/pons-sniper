@@ -10,7 +10,7 @@
   "gasReserveEth": "0.001",
   "takeProfitPercent": 50,
   "stopLossPercent": 30,
-  "maxHoldSeconds": 600,
+  "maxHoldSeconds": 0,
   "keywords": [],
   "blockedKeywords": ["test"],
   "allowedDeployers": [],
